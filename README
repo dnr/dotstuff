@@ -1,0 +1,176 @@
+
+dotstuff
+David Reiss <davidn@gmail.com>
+2012-04-24
+
+
+INTRO:
+
+dotstuff is a dotfile management system. It was designed for maintaining
+similar but slightly different sets of dotfiles and scripts on different
+systems. Not all configuration languages support conditional expressions
+or substitution, so it includes a simple preprocessor that lets you
+easily tweak dotfiles for the local environment, while keeping one copy
+of the common parts. All dotfiles are kept in a single version-
+controlled directory, that you can manage however you like (the default
+uses mercurial).
+
+
+TO START:
+
+1) In your home directory, run:
+   hg clone https://bitbucket.org/davidn/dotstuff
+2) Then run:
+   ~/dotstuff/DOT/dot -g
+   This will put a symlink to this script in ~/.bin
+3) Modify your $PATH to include $HOME/.bin so that you can run it as
+   just 'dot'.
+4) If you don't like mercurial, rm -rf ~/dotstuff/.hg and set it up your
+   favorite vcs.
+5) Put some dotfiles in ~/dotstuff.
+6) Run 'dot' to see what changes will happen, and 'dot -g' to make them.
+
+
+NEW SYSTEM SETUP:
+
+1) Clone your dotstuff repo to ~/dotstuff on the new system.
+2) Optionally, run: ~/dotstuff/DOT/dot --set-env bar
+3) Run: ~/dotstuff/DOT/dot
+   to see what will change.
+4) Tweak files in ~/dotstuff as necessary to avoid breakage and preserve
+   local changes, then run: ~/dotstuff/DOT/dot -g
+   to copy files. You can add '-b' to keep backups of all replaced
+   files.
+5) You may also want to log out and in again to check that everything is
+   working, especially if you changed ~/.xsession or similar.
+
+
+USAGE:
+
+The ~/dotstuff directory contains copies of all the dotfiles you want to
+manage. When you run 'dot' by itself, it will show you a diff between
+what's in ~/dotstuff and what's in ~. To actually perform the copies,
+run 'dot -g'. (Look at main() for more options.)
+
+The initial dot will be added implicitly, that is, your bashrc goes in
+~/dotstuff/bashrc (not ~/dotstuff/.bashrc).
+
+Subdirectories are fine: ~/dotstuff/ssh/config,
+~/dotstuff/vim/plugin/foo.vim, etc.
+
+The preprocessor syntax is described below.
+
+Running 'dot' with any non-flag arguments will pass through the command
+line to your favorite vcs, with the current directory set to ~/dotstuff.
+This makes it easy to tweak files and commit changes without cd'ing all
+over the place. A typical pattern looks like:
+
+  some/dir$ vi ~/dotstuff/bashrc
+  some/dir$ dot  # to check the changes
+  some/dir$ dot -g
+  some/dir$ exec bash  # to pick up changes
+  some/dir$ dot ci -m 'bashrc: ...'
+  some/dir$ dot push
+
+The special file '~/dotstuff/crontab' will get installed as the local
+crontab. You probably want to limit this to certain environments using
+the preprocessor.
+
+Directories with all-uppercase names are ignored. So ~/dotstuff/DOT/dot
+doesn't get copied anywhere (~/.bin/dot gets symlinked to it).
+Similarly, dotstuff/ENV/ files aren't copied anywhere, but they are
+synced so that there's one view of them.
+
+This means you can create ~/dotstuff/NOTES/blah for small text files and
+things that you want to get synced between machines, but not copied to
+your home directory.
+
+(Why not put this script directly in ~/dotstuff/bin/dot? That makes it
+hard to edit, because you'd need to keep running 'dot -g' to test
+changes while it may not be a runnable state. Why not put this script in
+a different repo than the dotfiles themselves? So that you only
+have to clone one thing for a new system setup.)
+
+
+ENVIRONMENTS:
+
+If you have accounts on multiple systems, give them each a name (sets of
+identical systems can get the same name). Then use preprocessor
+directives to turn on and off parts of files depending on the system. Or
+handle external paths that aren't in the same place.
+
+Environments are files in ~/dotstuff/ENV/. To use one, create a symlink
+~/.dotstuffenv that points to one. The command 'dot --set-env foo' does
+this for you.
+
+Environment files are simply a list of key=value lines, or just keys
+(which get the value '1'). The basename of the file is also added as a
+key with the value '1', as is the key 'true'. The key 'env' is set to
+the basename of the environment file.
+
+
+PREPROCESSOR:
+
+The preprocessor is line-based. All directive lines start with '---@'.
+
+---@link target
+Replace this file by a symlink to target. You can also use actual
+symlinks if your vcs supports versioning symlinks, but ---@link is more
+flexible because it supports macro expansion and expands '~/'.
+
+---@if [expr]
+---@else [expr]
+---@unless [expr]
+---@
+Conditionally include the lines in between the directives.
+Note that these do not nest! Each ---@if just evaluates the expression
+and turns copying on or off, ---@unless uses the negation of the
+expression, and ---@else negates the previous directive.
+
+---@@ comment
+Comments just get removed.
+
+---@ignore
+Stop processing immediately and don't touch the corresponding dotfile.
+
+---@vis {public|private}
+Make the corresponding file public (world-readable) or private. Useful
+on multi-user systems if you want to share some dotfiles but not others.
+All files are private by default.
+
+---@emptyok
+Allow creating an empty (or just whitespace) dotfile. (If a file turns
+out empty without ---@emptyok, it gets deleted.)
+
+---@-asdf-@---
+Anywhere in any line, gets replaced by the defintion of asdf in this
+environment. If it's not defined, that's a runtime error.
+
+
+If a file looks like binary (there's a nul byte in first 1K), no
+substitutions are done.
+
+If a file ends up with no non-whitespace characters, it gets deleted
+(unless ---@emptyok was found).
+
+
+Expressions (for ---@if, etc.) are the following:
+
+  key
+    true if key is defined (to any value)
+  key|key|key
+    true if any of those keys are defined
+  key=value
+    true if key is defined and has that value
+  key=value|value|value
+    true if key is defined and has any of those values
+
+
+
+TODO:
+
+handle changes to root-owned files outside of HOME?
+add syntax-check-only mode
+make directives more powerful? (nesting, elif, proper else)
+delete stuff in dstfn that shouldn't be there, if depth # > 0?
+

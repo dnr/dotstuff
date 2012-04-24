@@ -1,0 +1,468 @@
+#!/usr/bin/python -E
+# vim: ts=4 sw=4 noet
+
+__author__ = 'David Reiss <davidn@gmail.com>'
+
+import sys, os, stat, errno, shutil, re, hashlib, time, logging, optparse, difflib
+
+HOME = os.getenv('HOME')
+
+re_env_line = re.compile(r'^\s*(\w+)\s*(?:=(.*))?$')
+re_replace = re.compile(r'---@-(\w+)-@---')
+default_value = '1'
+default_passthrough = 'hg'
+allowed_vis = ('private', 'public', 'priv', 'pub')
+backup_suffix = '.ds-backup.%d' % time.time()
+join = os.path.join
+
+
+def is_binary(thing, prefix_len=1024):
+	if isinstance(thing, file):
+		thing.seek(0)
+		bin = '\0' in thing.read(prefix_len)
+		thing.seek(0)
+	elif isinstance(thing, str):
+		bin = '\0' in thing[:prefix_len]
+	else:
+		raise Exception('unknown thing')
+	return bin
+
+
+def make_tmpfn(dstfn):
+	# dstfn and the return value of this function must be in the same
+	# directory.
+	return dstfn + '.dotstuff.tmp'
+
+
+def sha_sum(thing):
+	s = hashlib.sha1()
+	if isinstance(thing, file):
+		thing.seek(0)
+		while True:
+			bytes = thing.read(1<<16)
+			if not bytes: break
+			s.update(bytes)
+		thing.seek(0)
+	elif isinstance(thing, str):
+		s.update(thing)
+	else:
+		raise Exception('unknown thing')
+	return s.digest()
+
+
+def print_diff(old, new, oldfn, newfn):
+	def to_text(s):
+		if is_binary(s):
+			return 'binary file: %s\n' % sha_sum(s).encode('hex')
+		else:
+			return s
+	for line in difflib.unified_diff(
+			to_text(old).splitlines(True),
+			to_text(new).splitlines(True),
+			fromfile=oldfn, tofile=newfn):
+		print line,
+
+
+def process_environment(fn):
+	env = {
+		'true': default_value,
+		'HOME': HOME,
+		'env': 'default',
+	}
+	if os.path.exists(fn):
+		basename = os.path.basename(os.path.realpath(fn))
+		env[basename] = default_value
+		env['env'] = basename
+		for line in open(fn):
+			m = re_env_line.match(line)
+			if m:
+				env[m.group(1)] = m.group(2) or default_value
+	for k, v in env.iteritems():
+		logging.debug('env: %s = %s', k, v)
+	return env
+
+
+def stat_or_none(fn):
+	try:
+		return os.lstat(fn)
+	except OSError, e:
+		if e.errno != errno.ENOENT:
+			raise
+		return None
+
+
+_parent_dir_cache = set()
+def ensure_parent_dir(fn):
+	dir = os.path.dirname(fn)
+	if dir not in _parent_dir_cache:
+		st = stat_or_none(dir)
+		if st is None:
+			ensure_parent_dir(dir)
+			os.mkdir(dir, int(opts.dir_perms, 8))
+		elif not stat.S_ISDIR(st.st_mode):
+			raise OSError('%r should be a directory' % dir)
+		_parent_dir_cache.add(dir)
+
+
+def make_symlink(dstfn, target, force=False):
+	if target.startswith('~/'):
+		target = HOME + target[1:]
+
+	dst = stat_or_none(dstfn)
+	if (dst and
+	    stat.S_ISLNK(dst.st_mode) and
+	    os.readlink(dstfn) == target):
+		logging.debug('symlink %s is correct', dstfn)
+		return
+
+	# create symlink
+	logging.info('symlinking %s -> %s', dstfn, target)
+	if opts.go or force:
+		tmpfn = make_tmpfn(dstfn)
+		ensure_parent_dir(tmpfn)
+		os.symlink(target, tmpfn)
+		os.rename(tmpfn, dstfn)
+	else:
+		print_diff('', 'symlink: %s\n' % target, dstfn, '')
+
+
+def check_perms(fn, mode, st=None):
+	if st is None:
+		st = stat_or_none(fn)
+	if st is None:
+		logging.debug('%s missing; not checking perms %#o', fn, mode)
+		return
+	if stat.S_IMODE(st.st_mode) == mode:
+		logging.debug('%s has correct perms %#o', fn, mode)
+	else:
+		logging.info('fixing perms on %s to %#o', fn, mode)
+		if opts.go:
+			os.chmod(fn, mode)
+
+
+def vis_to_perms(vis, mode):
+	if mode & 0111:
+		if vis.startswith('priv'):
+			return 0500
+		else: # vis.startswith('pub'):
+			return 0555
+	else:
+		if vis.startswith('priv'):
+			return 0400
+		else: # vis.startswith('pub'):
+			return 0444
+
+
+def evaluate_expression(expr, env):
+	if '=' in expr:
+		key, val = expr.split('=', 1)
+		key = key.strip()
+		val = map(str.strip, val.split('|'))
+		return env.get(key) in val
+	else:
+		keys = map(str.strip, expr.split('|'))
+		for key in keys:
+			if env.get(key):
+				return True
+		return False
+
+
+def process_directives(src, env):
+	out = []
+	copying = True
+	emptyok = False
+	vis = opts.default_vis
+	ifs_since_last_endif = 0
+	for line in src:
+		if not line.startswith('---@') or line.startswith('---@-'):
+			if copying:
+				if '---@-' in line:
+					line = re_replace.sub(
+							lambda m: env[m.group(1)],
+							line)
+				out.append(line)
+		elif line.startswith('---@@'):
+			# comment
+			pass
+		elif line.startswith('---@vis'):
+			# set visibility level
+			if copying:
+				vis = line[7:].strip()
+				assert vis in allowed_vis
+		elif line.startswith('---@emptyok'):
+			emptyok = True
+		elif line.startswith('---@ignore'):
+			if copying:
+				return ('ignore', None, None)
+		elif line.startswith('---@delete'):
+			# delete this file
+			if copying:
+				logging.debug('found delete directive')
+				return ('delete', None, None)
+		elif line.startswith('---@link '):
+			# convert to symlink
+			if copying:
+				target = line[9:].strip()
+				logging.debug('found symlink directive: %s', target)
+				return ('symlink', target, None)
+		elif line.startswith('---@if '):
+			# conditional
+			ifs_since_last_endif += 1
+			copying = evaluate_expression(line[7:], env)
+		elif line.startswith('---@unless '):
+			# inverted conditional
+			ifs_since_last_endif += 1
+			copying = not evaluate_expression(line[11:], env)
+		elif line.startswith('---@else'):
+			# invert sense of last conditional
+			assert ifs_since_last_endif == 1, 'invalid use of @else'
+			copying = not copying
+		elif line.startswith('---@'):
+			# end if
+			copying = True
+			ifs_since_last_endif = 0
+
+	assert ifs_since_last_endif == 0, 'unclosed @if'
+
+	out = ''.join(out)
+	if not emptyok and (not out or out.isspace()):
+		return ('delete', None, None)
+	else:
+		return ('data', out, vis)
+
+
+def copy_reg(srcfn, dstfn, env, st):
+	dst = stat_or_none(dstfn)
+
+	# quick check
+	if (opts.quick and
+	    dst and
+	    stat.S_ISREG(dst.st_mode) and
+	    st.st_mtime == dst.st_mtime):
+		# mtimes match, assume contents ok
+		logging.debug('mtime match for %s', dstfn)
+		return
+
+	src = open(srcfn)
+
+	if is_binary(src):
+		# don't interpret binary files
+		action, newdata, vis = 'data', src.read(), opts.default_vis
+	else:
+		action, newdata, vis = process_directives(src, env)
+
+	if action == 'delete':
+		# signal to remove dest
+		if dst:
+			logging.info('removing %s', dstfn)
+			if opts.go:
+				if stat.S_ISDIR(dst.st_mode):
+					shutil.rmtree(dstfn)
+				else:
+					os.remove(dstfn)
+			else:
+				olddata = open(dstfn).read()
+				newdata = ''
+				print_diff(open(dstfn).read(), '', dstfn, '/dev/null')
+
+	elif action == 'symlink':
+		# turn file into symlink
+		make_symlink(dstfn, newdata)
+	elif action == 'ignore':
+		return
+	elif action == 'data':
+		# regular file
+		perms = vis_to_perms(vis, st.st_mode)
+
+		# compare to existing destination
+		if (dst and
+		    stat.S_ISREG(dst.st_mode) and
+		    len(newdata) == dst.st_size and
+		    sha_sum(newdata) == sha_sum(open(dstfn))):
+			# checksums match, just fix perms and mtime
+			logging.debug('checksum match for %s', dstfn)
+			check_perms(dstfn, perms, dst)
+			if opts.go:
+				os.utime(dstfn, (st.st_atime, st.st_mtime))
+			return
+
+		logging.info('copying %s -> %s', srcfn, dstfn)
+		if opts.go:
+			tmpfn = make_tmpfn(dstfn)
+			ensure_parent_dir(tmpfn)
+			fobj = open(tmpfn, 'w')
+			fobj.write(newdata)
+			fobj.close()
+
+			# copy mtime and set perms
+			os.utime(tmpfn, (st.st_atime, st.st_mtime))
+			os.chmod(tmpfn, perms)
+
+			if opts.backup and dst:
+				logging.debug('backing up to %s', dstfn + backup_suffix)
+				os.link(dstfn, dstfn + backup_suffix)
+
+			os.rename(tmpfn, dstfn)
+		else:
+			if dst and stat.S_ISREG(dst.st_mode):
+				olddata = open(dstfn).read()
+			else:
+				olddata = ''
+			print_diff(olddata, newdata, dstfn, srcfn)
+	else:
+		raise Exception('unknown action %r' % action)
+
+
+def copy_crontab(srcfn, env):
+	def get_crontab():
+		p = os.popen('crontab -l 2>/dev/null', 'r')
+		data = p.read()
+		status = p.close()
+		assert status is None or (
+			os.WIFEXITED(status) and os.WEXITSTATUS(status) in (0, 1))
+		return data
+	def put_crontab(data):
+		p = os.popen('crontab -', 'w')
+		p.write(data)
+		assert not p.close()
+	def backup_crontab(olddata):
+		if opts.backup and olddata:
+			backup_path = join(HOME, '.crontab' + backup_suffix)
+			logging.debug('backing up to %s', backup_path)
+			open(backup_path, 'w').write(olddata)
+			os.chmod(backup_path, 0400)
+
+	action, newdata, vis = process_directives(open(srcfn), env)
+	olddata = get_crontab()
+
+	if action == 'delete':
+		if olddata:
+			if opts.go:
+				logging.info('deleting crontab')
+				backup_crontab(olddata)
+				crontab_delete = env.get('crontab_delete')
+				if crontab_delete is None:
+					put_crontab('')  # most portable
+				else:
+					assert not os.system(crontab_delete)
+			else:
+				print_diff(olddata, '', 'crontab', srcfn)
+		else:
+			logging.debug('crontab already empty')
+	elif action == 'symlink':
+		raise Exception('got invalid symlink directive in crontab')
+	elif action == 'ignore':
+		return
+	elif action == 'data':
+		if olddata != newdata:
+			if opts.go:
+				logging.info('installing new crontab')
+				backup_crontab(olddata)
+				put_crontab(newdata)
+			else:
+				print_diff(olddata, newdata, 'crontab', srcfn)
+		else:
+			logging.debug('crontab matches')
+	else:
+		raise Exception('unknown action %r' % action)
+
+
+def copy_dir(srcfn, dstfn, env, depth, st):
+	for fn in os.listdir(srcfn):
+		if fn.startswith('.'):
+			continue
+		if depth == 0 and fn.upper() == fn:
+			continue
+
+		srcpath = join(srcfn, fn)
+
+		if depth == 0:
+			fn = '.' + fn
+		dstpath = join(dstfn, fn)
+
+		copy_stuff(srcpath, dstpath, env, depth+1)
+
+
+def copy_stuff(srcfn, dstfn, env, depth):
+	st = os.lstat(srcfn)
+	if stat.S_ISREG(st.st_mode):
+		if depth == 1 and os.path.basename(srcfn) == 'crontab':
+			copy_crontab(srcfn, env)
+		else:
+			copy_reg(srcfn, dstfn, env, st)
+	elif stat.S_ISDIR(st.st_mode):
+		copy_dir(srcfn, dstfn, env, depth, st)
+	elif stat.S_ISLNK(st.st_mode):
+		make_symlink(dstfn, os.readlink(srcfn))
+
+
+def set_env():
+	env_path = join(opts.source, 'ENV', opts.set_env)
+	if not os.path.exists(env_path):
+		logging.debug('creating new environment file %s', env_path)
+		open(env_path, 'w').write('# %s\n' % opts.set_env)
+
+	# try to relativize the symlink
+	target = env_path
+	env_dir = os.path.dirname(opts.env) + '/'
+	if target.startswith(env_dir):
+		target = target[len(env_dir):]
+
+	make_symlink(opts.env, target, force=True)
+
+
+def main():
+
+	op = optparse.OptionParser()
+	op.disable_interspersed_args()
+	op.add_option('-v', '--verbose', action='store_true', default=False)
+	op.add_option('-g', '--go', action='store_true', default=False)
+	op.add_option('-b', '--backup', action='store_true', default=False)
+	op.add_option('-m', '--skip-mtime-check', action='store_false',
+			dest='quick', default=True)
+	op.add_option('--dest', default=HOME)
+	op.add_option('--source', default=HOME + '/dotstuff')
+	op.add_option('-e', '--env', default=HOME + '/.dotstuffenv')
+	op.add_option('--set-env')
+	op.add_option('--default-vis', default='private', choices=allowed_vis)
+	op.add_option('--source-perms', default='700')
+	op.add_option('--dir-perms', default='700')
+	op.add_option('--diff_with_directives', action='store_true', default=False)
+
+	global opts
+	opts, args = op.parse_args()
+
+	if opts.diff_with_directives:
+		os.execvp('diff', [
+			'diff',
+			'--old-group-format=---@if AAAAA\n%<---@\n',
+			'--new-group-format=---@if BBBBB\n%<---@\n',
+			'--changed-group-format=---@if AAAAA\n%<---@if BBBBB\n%>---@\n',
+			] + args)
+
+	if args:
+		os.chdir(opts.source)
+		passthrough = os.getenv('DOTSTUFF_PASSTHROUGH', default_passthrough)
+		os.execvp(passthrough, [passthrough] + args)
+
+	if opts.verbose:
+		level = logging.DEBUG
+	else:
+		level = logging.INFO
+
+	logging.basicConfig(
+			level=level,
+			format='%(levelname)1.1s %(asctime)s %(message)s')
+
+	# make sure source dir is private
+	check_perms(opts.source, int(opts.source_perms, 8))
+
+	if opts.set_env:
+		set_env()
+
+	env = process_environment(opts.env)
+	copy_stuff(opts.source, opts.dest, env, 0)
+
+
+if __name__ == '__main__':
+	sys.exit(main())
