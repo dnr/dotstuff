@@ -19,16 +19,14 @@ uses mercurial).
 TO START:
 
 1) In your home directory, run:
-   hg clone https://bitbucket.org/davidn/dotstuff
+   git clone https://github.com/dnr/dotstuff
 2) Then run:
    ~/dotstuff/DOT/dot -g
    This will put a symlink to this script in ~/.bin
 3) Modify your $PATH to include $HOME/.bin so that you can run it as
    just 'dot'.
-4) If you don't like mercurial, rm -rf ~/dotstuff/.hg and set it up your
-   favorite vcs.
-5) Put some dotfiles in ~/dotstuff.
-6) Run 'dot' to see what changes will happen, and 'dot -g' to make them.
+4) Put some dotfiles in ~/dotstuff.
+5) Run 'dot' to see what changes will happen, and 'dot -g' to make them.
 
 
 NEW SYSTEM SETUP:
@@ -61,7 +59,7 @@ Subdirectories are fine: ~/dotstuff/ssh/config,
 The preprocessor syntax is described below.
 
 Running 'dot' with any non-flag arguments will pass through the command
-line to your favorite vcs, with the current directory set to ~/dotstuff.
+line to git, with the current directory set to ~/dotstuff.
 This makes it easy to tweak files and commit changes without cd'ing all
 over the place. A typical pattern looks like:
 
@@ -69,7 +67,7 @@ over the place. A typical pattern looks like:
   some/dir$ dot  # to check the changes
   some/dir$ dot -g
   some/dir$ exec bash  # to pick up changes
-  some/dir$ dot ci -m 'bashrc: ...'
+  some/dir$ dot commit -am 'bashrc: ...'
   some/dir$ dot push
 
 The special file '~/dotstuff/crontab' will get installed as the local

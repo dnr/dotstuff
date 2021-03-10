@@ -1,7 +1,7 @@
-#!/usr/bin/python -E
+#!/usr/bin/env -S python3 -E
 # vim: ts=4 sw=4 noet
 
-__author__ = 'David Reiss <davidn@gmail.com>'
+__author__ = 'David Reiss <dnr@dnr.im>'
 
 import sys, os, stat, errno, shutil, re, hashlib, time, logging, optparse, difflib
 
@@ -10,22 +10,17 @@ HOME = os.getenv('HOME')
 re_env_line = re.compile(r'^\s*(\w+)\s*(?:=(.*))?$')
 re_replace = re.compile(r'---@-(\w+)-@---')
 default_value = '1'
-default_passthrough = 'hg'
+default_passthrough = 'git'
 allowed_vis = ('private', 'public', 'priv', 'pub')
+dir_directive = '---@dir'
 backup_suffix = '.ds-backup.%d' % time.time()
 join = os.path.join
 
 
-def is_binary(thing, prefix_len=1024):
-	if isinstance(thing, file):
-		thing.seek(0)
-		bin = '\0' in thing.read(prefix_len)
-		thing.seek(0)
-	elif isinstance(thing, str):
-		bin = '\0' in thing[:prefix_len]
-	else:
-		raise Exception('unknown thing')
-	return bin
+def open_in_appropriate_mode(fn):
+	with open(fn, 'rb') as f:
+		isbin = b'\0' in f.read(4096)
+	return open(fn, 'rb' if isbin else 'r')
 
 
 def make_tmpfn(dstfn):
@@ -36,15 +31,17 @@ def make_tmpfn(dstfn):
 
 def sha_sum(thing):
 	s = hashlib.sha1()
-	if isinstance(thing, file):
+	if hasattr(thing, 'seek') and hasattr(thing, 'read'):
 		thing.seek(0)
 		while True:
-			bytes = thing.read(1<<16)
-			if not bytes: break
-			s.update(bytes)
+			b = thing.read(1<<18)
+			if not b: break
+			s.update(b if isinstance(b, bytes) else b.encode('utf8'))
 		thing.seek(0)
-	elif isinstance(thing, str):
+	elif isinstance(thing, bytes):
 		s.update(thing)
+	elif isinstance(thing, str):
+		s.update(thing.encode('utf8'))
 	else:
 		raise Exception('unknown thing')
 	return s.digest()
@@ -52,15 +49,15 @@ def sha_sum(thing):
 
 def print_diff(old, new, oldfn, newfn):
 	def to_text(s):
-		if is_binary(s):
-			return 'binary file: %s\n' % sha_sum(s).encode('hex')
+		if isinstance(s, bytes):
+			return '[binary file: %s]\n' % sha_sum(s).hex()
 		else:
 			return s
 	for line in difflib.unified_diff(
 			to_text(old).splitlines(True),
 			to_text(new).splitlines(True),
 			fromfile=oldfn, tofile=newfn):
-		print line,
+		print(line, end='')
 
 
 def process_environment(fn):
@@ -77,7 +74,7 @@ def process_environment(fn):
 			m = re_env_line.match(line)
 			if m:
 				env[m.group(1)] = m.group(2) or default_value
-	for k, v in env.iteritems():
+	for k, v in env.items():
 		logging.debug('env: %s = %s', k, v)
 	return env
 
@@ -85,7 +82,7 @@ def process_environment(fn):
 def stat_or_none(fn):
 	try:
 		return os.lstat(fn)
-	except OSError, e:
+	except OSError as e:
 		if e.errno != errno.ENOENT:
 			raise
 		return None
@@ -141,36 +138,29 @@ def check_perms(fn, mode, st=None):
 
 
 def vis_to_perms(vis, mode):
-	if mode & 0111:
+	if mode & 0o111:
 		if vis.startswith('priv'):
-			return 0500
+			return 0o500
 		else: # vis.startswith('pub'):
-			return 0555
+			return 0o555
 	else:
 		if vis.startswith('priv'):
-			return 0400
+			return 0o400
 		else: # vis.startswith('pub'):
-			return 0444
+			return 0o444
 
 
 def evaluate_expression(expr, env):
 	if '=' in expr:
-		key, val = expr.split('=', 1)
-		key = key.strip()
-		val = map(str.strip, val.split('|'))
-		return env.get(key) in val
+		key, opts = expr.split('=', 1)
+		return env.get(key.strip()) in (v.strip() for v in opts.split('|'))
 	else:
-		keys = map(str.strip, expr.split('|'))
-		for key in keys:
-			if env.get(key):
-				return True
-		return False
+		return any(env.get(v.strip()) for v in expr.split('|'))
 
 
-def process_directives(src, env):
+def process_directives(src, env, emptyok=False):
 	out = []
 	copying = True
-	emptyok = False
 	vis = opts.default_vis
 	ifs_since_last_endif = 0
 	for line in src:
@@ -231,6 +221,23 @@ def process_directives(src, env):
 		return ('data', out, vis)
 
 
+def delete_dir(dstfn, dst):
+	if not dst:
+		return
+	logging.info('removing %s', dstfn)
+	if opts.go:
+		if stat.S_ISDIR(dst.st_mode):
+			shutil.rmtree(dstfn)
+		else:
+			os.remove(dstfn)
+	else:
+		if dst and stat.S_ISREG(dst.st_mode):
+			olddata = open_in_appropriate_mode(dstfn).read()
+		else:
+			olddata = 'directory: %s\n' % dstfn
+		print_diff(olddata, '', dstfn, '/dev/null')
+
+
 def copy_reg(srcfn, dstfn, env, st):
 	dst = stat_or_none(dstfn)
 
@@ -243,9 +250,9 @@ def copy_reg(srcfn, dstfn, env, st):
 		logging.debug('mtime match for %s', dstfn)
 		return
 
-	src = open(srcfn)
+	src = open_in_appropriate_mode(srcfn)
 
-	if is_binary(src):
+	if src.mode == 'rb':
 		# don't interpret binary files
 		action, newdata, vis = 'data', src.read(), opts.default_vis
 	else:
@@ -253,18 +260,7 @@ def copy_reg(srcfn, dstfn, env, st):
 
 	if action == 'delete':
 		# signal to remove dest
-		if dst:
-			logging.info('removing %s', dstfn)
-			if opts.go:
-				if stat.S_ISDIR(dst.st_mode):
-					shutil.rmtree(dstfn)
-				else:
-					os.remove(dstfn)
-			else:
-				olddata = open(dstfn).read()
-				newdata = ''
-				print_diff(open(dstfn).read(), '', dstfn, '/dev/null')
-
+		delete_dir(dstfn, dst)
 	elif action == 'symlink':
 		# turn file into symlink
 		make_symlink(dstfn, newdata)
@@ -277,8 +273,7 @@ def copy_reg(srcfn, dstfn, env, st):
 		# compare to existing destination
 		if (dst and
 		    stat.S_ISREG(dst.st_mode) and
-		    len(newdata) == dst.st_size and
-		    sha_sum(newdata) == sha_sum(open(dstfn))):
+		    sha_sum(newdata) == sha_sum(open_in_appropriate_mode(dstfn))):
 			# checksums match, just fix perms and mtime
 			logging.debug('checksum match for %s', dstfn)
 			check_perms(dstfn, perms, dst)
@@ -290,7 +285,7 @@ def copy_reg(srcfn, dstfn, env, st):
 		if opts.go:
 			tmpfn = make_tmpfn(dstfn)
 			ensure_parent_dir(tmpfn)
-			fobj = open(tmpfn, 'w')
+			fobj = open(tmpfn, 'wb' if isinstance(newdata, bytes) else 'w')
 			fobj.write(newdata)
 			fobj.close()
 
@@ -305,9 +300,9 @@ def copy_reg(srcfn, dstfn, env, st):
 			os.rename(tmpfn, dstfn)
 		else:
 			if dst and stat.S_ISREG(dst.st_mode):
-				olddata = open(dstfn).read()
+				olddata = open_in_appropriate_mode(dstfn).read()
 			else:
-				olddata = ''
+				olddata = b'' if src.mode == 'rb' else ''
 			print_diff(olddata, newdata, dstfn, srcfn)
 	else:
 		raise Exception('unknown action %r' % action)
@@ -330,7 +325,7 @@ def copy_crontab(srcfn, env):
 			backup_path = join(HOME, '.crontab' + backup_suffix)
 			logging.debug('backing up to %s', backup_path)
 			open(backup_path, 'w').write(olddata)
-			os.chmod(backup_path, 0400)
+			os.chmod(backup_path, 0o400)
 
 	action, newdata, vis = process_directives(open(srcfn), env)
 	olddata = get_crontab()
@@ -368,7 +363,7 @@ def copy_crontab(srcfn, env):
 
 
 def copy_dir(srcfn, dstfn, env, depth, st):
-	for fn in os.listdir(srcfn):
+	for fn in sorted(os.listdir(srcfn)):
 		if fn.startswith('.'):
 			continue
 		if depth == 0 and fn.upper() == fn:
@@ -380,7 +375,18 @@ def copy_dir(srcfn, dstfn, env, depth, st):
 			fn = '.' + fn
 		dstpath = join(dstfn, fn)
 
-		copy_stuff(srcpath, dstpath, env, depth+1)
+		if fn == dir_directive:
+			action, _, _ = process_directives(open(srcpath), env, emptyok=True)
+			if action == 'ignore':
+				return  # Ignore whole directory.
+			elif action == 'delete':
+				delete_dir(dstfn, stat_or_none(dstfn))
+			elif action == 'data':
+				pass
+			else:
+				raise Exception('invalid action in %r' % srcpath)
+		else:
+			copy_stuff(srcpath, dstpath, env, depth+1)
 
 
 def copy_stuff(srcfn, dstfn, env, depth):
@@ -412,6 +418,10 @@ def set_env():
 
 
 def main():
+	# graphviz compatability:
+	if any(arg.startswith('-T') for arg in sys.argv):
+		try: os.execv('/usr/bin/dot', sys.argv)
+		except OSError: os.execv('/usr/local/bin/dot', sys.argv)
 
 	op = optparse.OptionParser()
 	op.disable_interspersed_args()
